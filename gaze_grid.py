@@ -151,6 +151,35 @@ def list_cameras(max_index=10):
 # ----------------------------------------------------------------------------
 # SIATKA EKRANU (12 POL)
 # ----------------------------------------------------------------------------
+def open_grid_window(name, fallback_w, fallback_h, fullscreen=True):
+    """Otwiera okno siatki i zwraca jego realny rozmiar w pikselach.
+
+    Plotno musi miec rozmiar okna, bo pola siatki wyznaczaja katy spojrzenia:
+    kalibracja przeprowadzona w malym oknie uczy klasyfikator innego rozkladu
+    niz ten, ktory wystapi przy pracy na pelnym ekranie.
+    """
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    if fullscreen:
+        cv2.setWindowProperty(name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    else:
+        cv2.resizeWindow(name, fallback_w, fallback_h)
+        return fallback_w, fallback_h
+
+    # okno musi sie raz wyrenderowac, zanim poda swoj rozmiar
+    cv2.imshow(name, np.zeros((fallback_h, fallback_w, 3), dtype=np.uint8))
+    cv2.waitKey(200)
+    try:
+        _, _, w, h = cv2.getWindowImageRect(name)
+    except cv2.error:
+        w = h = 0
+
+    if w <= 0 or h <= 0:
+        print(f"Nie udalo sie odczytac rozmiaru ekranu - uzywam "
+              f"{fallback_w}x{fallback_h}. Mozesz podac wlasny: --width/--height")
+        return fallback_w, fallback_h
+    return w, h
+
+
 def zone_rects(screen_w, screen_h):
     cw, ch = screen_w // GRID_COLS, screen_h // GRID_ROWS
     rects = []
@@ -285,7 +314,8 @@ class DwellTracker:
 # ----------------------------------------------------------------------------
 # KALIBRACJA
 # ----------------------------------------------------------------------------
-def run_calibration(cap, landmarker, screen_w, screen_h):
+def run_calibration(cap, landmarker, screen_w, screen_h, fullscreen=True):
+    screen_w, screen_h = open_grid_window("Kalibracja", screen_w, screen_h, fullscreen)
     rects = zone_rects(screen_w, screen_h)
     X, y = [], []
 
@@ -400,7 +430,8 @@ def on_zone_activated(zone_idx):
     print(f"[AKTYWACJA] pole {zone_idx + 1}")
 
 
-def run_live(cap, landmarker, classifier, screen_w, screen_h):
+def run_live(cap, landmarker, classifier, screen_w, screen_h, fullscreen=True):
+    screen_w, screen_h = open_grid_window("Gaze-Grid", screen_w, screen_h, fullscreen)
     rects = zone_rects(screen_w, screen_h)
     tracker = DwellTracker(on_activate=on_zone_activated)
     read_failures = 0
@@ -447,8 +478,13 @@ def main():
     parser.add_argument("--list-cameras", action="store_true",
                         help="wypisz kamery, ktore realnie oddaja obraz")
     parser.add_argument("--camera", type=int, default=0, help="indeks kamery (domyslnie 0)")
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=720)
+    parser.add_argument("--windowed", action="store_true",
+                        help="siatka w oknie zamiast na pelnym ekranie "
+                             "(kalibracja i praca musza uzywac tego samego trybu)")
+    parser.add_argument("--width", type=int, default=1280,
+                        help="szerokosc okna dla --windowed (domyslnie 1280)")
+    parser.add_argument("--height", type=int, default=720,
+                        help="wysokosc okna dla --windowed (domyslnie 720)")
     args = parser.parse_args()
 
     if args.list_cameras:
@@ -488,7 +524,8 @@ def main():
             run_debug(cap, landmarker)
 
         elif args.calibrate:
-            X, y = run_calibration(cap, landmarker, args.width, args.height)
+            X, y = run_calibration(cap, landmarker, args.width, args.height,
+                                   fullscreen=not args.windowed)
             if X is not None:
                 clf = ZoneClassifier()
                 acc, per_zone = clf.fit_with_report(X, y)
@@ -507,7 +544,8 @@ def main():
         elif args.run:
             clf = ZoneClassifier()
             clf.load()
-            run_live(cap, landmarker, clf, args.width, args.height)
+            run_live(cap, landmarker, clf, args.width, args.height,
+                     fullscreen=not args.windowed)
 
     finally:
         cap.release()

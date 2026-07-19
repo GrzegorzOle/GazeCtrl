@@ -131,6 +131,14 @@ pozycję głowy i powtórzyć.
 
 ESC kończy każdy tryb. Wszystkie tryby przyjmują `--camera N`.
 
+Kalibracja i praca wyświetlają siatkę **na pełnym ekranie**, a rozmiar ekranu
+wykrywany jest automatycznie. Jest to istotne dla poprawności: pola siatki
+wyznaczają kąty spojrzenia, więc kalibracja w małym oknie nauczyłaby
+klasyfikator innego rozkładu niż ten, który wystąpi przy pracy. Z tego samego
+powodu **oba tryby muszą używać tego samego trybu wyświetlania** — jeśli
+kalibrujesz z `--windowed`, pracuj też z `--windowed` (i tym samym
+`--width`/`--height`).
+
 ## Ograniczenia
 
 - **Kalibracja jest per-użytkownik i per-ustawienie.** Zmiana pozycji względem
