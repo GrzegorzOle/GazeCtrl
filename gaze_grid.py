@@ -245,6 +245,38 @@ def describe_confusion_pattern(weak, confusions):
             "(oswietlenie, odbicia w okularach, ruchy glowy) niz blad geometrii.")
 
 
+def draw_fixation_point(canvas, rect, settling, progress, remaining):
+    """Rysuje punkt fiksacji w srodku pola kalibrowanego.
+
+    Podswietlony kwadrat pozwala wzrokowi bladzic po calym polu, wiec probki
+    jednej klasy rozjezdzaja sie po duzym kacie i klasy zachodza na siebie.
+    Punkt sciaga wzrok w jedno miejsce i zaciesnia klaster.
+    """
+    x1, y1, x2, y2 = rect
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    r = max(10, canvas.shape[0] // 60)
+
+    if settling:
+        # cyfra dokladnie na srodku pola, a nie obok kropki: czytanie jej
+        # trzyma wzrok w miejscu, w ktorym ma byc, gdy ruszy zbieranie
+        text = str(int(remaining) + 1)
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.8, 3)
+        cv2.putText(canvas, text, (cx - tw // 2, cy + th // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.8, (130, 130, 130), 3)
+        # kurczacy sie pierscien - sygnal peryferyjny, widac go bez
+        # odrywania wzroku od srodka
+        cv2.circle(canvas, (cx, cy), int(r + 3 * r * min(remaining, 1.5) / 1.5),
+                   (70, 70, 70), 2)
+        return
+
+    cv2.circle(canvas, (cx, cy), r, (255, 255, 255), -1)
+    cv2.circle(canvas, (cx, cy), r + 4, (0, 220, 0), 2)
+    # pierscien postepu - widac, ile jeszcze trzeba patrzec, bez odrywania
+    # wzroku od punktu
+    cv2.ellipse(canvas, (cx, cy), (2 * r, 2 * r), -90, 0,
+                int(360 * progress), (0, 220, 0), 4)
+
+
 def draw_grid(canvas, rects, active_zone=None, progress=0.0, labels=None):
     for i, (x1, y1, x2, y2) in enumerate(rects):
         cv2.rectangle(canvas, (x1, y1), (x2, y2), (60, 60, 60), 1)
@@ -420,19 +452,14 @@ def run_calibration(cap, landmarker, screen_w, screen_h, fullscreen=True,
                 settling = remaining > 0
 
                 canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
-                draw_grid(canvas, rects, active_zone=zone_idx,
-                          progress=0.0 if settling else collected / per_round)
+                # sama siatka, bez podswietlenia pola i bez numerow - wzrok ma
+                # trzymac sie punktu, wiec nic innego nie powinno go przyciagac
+                draw_grid(canvas, rects, labels=[""] * N_ZONES)
+                draw_fixation_point(canvas, rects[zone_idx], settling,
+                                    collected / per_round, remaining)
 
-                # odliczanie w polu: bez niego zmiana pola jest zaskoczeniem
-                # i pierwsze probki lapia wzrok jeszcze w drodze
-                if settling:
-                    x1, y1, x2, y2 = rects[zone_idx]
-                    cv2.putText(canvas, str(int(remaining) + 1),
-                                ((x1 + x2) // 2 - 30, (y1 + y2) // 2 + 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 2.5, (120, 120, 120), 4)
-
-                status = ("Przenies wzrok na podswietlone pole..." if settling
-                          else "PATRZ - zbieram probki (ESC = przerwij)")
+                status = ("Przenies wzrok na kropke..." if settling
+                          else "PATRZ W KROPKE - zbieram probki (ESC = przerwij)")
                 cv2.putText(canvas, status, (30, screen_h - 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
                 cv2.putText(canvas, f"runda {round_idx + 1}/{CALIB_ROUNDS}",

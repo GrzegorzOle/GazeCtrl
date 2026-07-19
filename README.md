@@ -123,6 +123,13 @@ wzrok jest jeszcze w drodze:
 .venv/bin/python gaze_grid.py --calibrate
 ```
 
+Podczas kalibracji patrzysz w **kropkę w środku pola**, a nie na podświetlony
+kwadrat. Kwadrat pozwala wzrokowi błądzić po całym polu (przy 1920×1080 to
+obszar 480×360 px), więc próbki jednej klasy rozjeżdżają się po dużym kącie
+i klasy zachodzą na siebie. Punkt ściąga wzrok w jedno miejsce. Odliczanie
+wyświetla się dokładnie na środku pola, żeby czytanie go nie odciągało wzroku
+od celu w momencie startu zbierania.
+
 Pola zapalają się w **losowej kolejności, innej w każdej rundzie**. Przy stałej
 kolejności 1→12 wszystko, co dryfuje w czasie kalibracji — osuwająca się głowa,
 zmiana światła, zmęczenie oczu — byłoby skorelowane z numerem pola, a model
