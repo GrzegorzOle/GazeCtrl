@@ -54,8 +54,7 @@ from mediapipe.tasks.python import vision as mp_vision
 GRID_ROWS, GRID_COLS = 3, 4                 # 3x4 = 12 pol
 N_ZONES = GRID_ROWS * GRID_COLS
 
-# na oko: pozycja tesczowki (poziom, pion) + pion wzgledem powieki + rozwarcie
-FEATURE_DIM = 8                             # patrz extract_features
+FEATURE_DIM = 4                             # ax, ay, bx, by (patrz extract_features)
 
 WEAK_ZONE_ACC = 0.8                         # ponizej tego pole uznajemy za slabe
                                             # i szukamy wzorca w pomylkach
@@ -88,8 +87,6 @@ CALIB_DATA_PATH = "calibration_data.npz"    # surowe probki - pozwalaja analizow
 # debug_draw_landmarks) - w razie potrzeby po prostu zamien pary miejscami.
 EYE_A_CORNERS = (33, 133)
 EYE_B_CORNERS = (362, 263)
-EYE_A_LIDS = (159, 145)                     # gorna, dolna powieka
-EYE_B_LIDS = (386, 374)
 IRIS_A = [469, 470, 471, 472]
 IRIS_B = [474, 475, 476, 477]
 
@@ -118,7 +115,7 @@ def extract_features(landmarks, transform_matrix, frame_w, frame_h) -> np.ndarra
     else:
         pts = np.array([[lm.x * frame_w, lm.y * frame_h] for lm in landmarks])
 
-    def iris_ratio(iris_idx, corner_idx, lid_idx):
+    def iris_ratio(iris_idx, corner_idx):
         iris_c = pts[iris_idx].mean(axis=0)
         c1, c2 = pts[corner_idx[0]], pts[corner_idx[1]]
         eye_vec = c2 - c1
@@ -126,25 +123,22 @@ def extract_features(landmarks, transform_matrix, frame_w, frame_h) -> np.ndarra
         t = np.dot(iris_c - c1, eye_vec) / (eye_len ** 2)      # poziomo: ~0..1
         eye_mid = (c1 + c2) / 2
         v = (iris_c[1] - eye_mid[1]) / eye_len                  # pionowo
+        return t, v
 
-        # Powieka niesie osobny trop o pionie: patrzenie w dol ja przymyka.
-        # Rozwarcie i polozenie tesczowki wzgledem szpary powiekowej dopiero
-        # razem daja zysk - kazde z osobna nie poprawia nic (patrz naglowek).
-        upper, lower = pts[lid_idx[0]], pts[lid_idx[1]]
-        aperture = np.linalg.norm(upper - lower)
-        lid_v = (iris_c[1] - (upper[1] + lower[1]) / 2) / (aperture + 1e-6)
-        return t, v, lid_v, aperture / eye_len
+    ax, ay = iris_ratio(IRIS_A, EYE_A_CORNERS)
+    bx, by = iris_ratio(IRIS_B, EYE_B_CORNERS)
 
-    ax, ay, a_lid, a_ap = iris_ratio(IRIS_A, EYE_A_CORNERS, EYE_A_LIDS)
-    bx, by, b_lid, b_ap = iris_ratio(IRIS_B, EYE_B_CORNERS, EYE_B_LIDS)
-
-    # yaw/pitch glowy celowo NIE wchodza do wektora cech. Miały kompensowac
-    # ruch glowy, ale przy w miare nieruchomej glowie koduja glownie dryf
-    # miedzy rundami kalibracji - model chwyta sie ich i przestaje uogolniac
-    # na nowa runde. Sama pozycja tesczowki wzgledem kacikow oka jest juz
-    # z definicji odporna na pozycje glowy.
-    return np.array([ax, ay, a_lid, a_ap,
-                     bx, by, b_lid, b_ap], dtype=np.float32)
+    # Probowane i odrzucone, zeby nie wracac do tego w kolko:
+    # - yaw/pitch glowy: koduja dryf miedzy rundami, model sie ich chwyta
+    #   i przestaje uogolniac na nowa runde;
+    # - cechy powiek (polozenie tesczowki wzgledem szpary + rozwarcie):
+    #   wygladaly na +9 pkt, ale to bylo przeuczenie doboru cech na tym samym
+    #   zbiorze, na ktorym mierzylem. Na swiezej kalibracji daja +0.9 pkt,
+    #   czyli tyle, ile wynosi rozrzut miedzy ziarnami MLP.
+    # Glowne zrodlo bledu to dryf glowy w trakcie kalibracji: srednie ax
+    # przesuwa sie miedzy runda pierwsza a ostatnia o 18% calego sygnalu
+    # odrozniajacego kolumny. Tam sa punkty do odzyskania, nie w cechach.
+    return np.array([ax, ay, bx, by], dtype=np.float32)
 
 
 # ----------------------------------------------------------------------------
