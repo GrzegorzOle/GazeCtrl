@@ -23,7 +23,7 @@ skuteczności. Kolejny krok to weryfikacja opisana w
 |---|---|
 | Detekcja twarzy i tęczówek (MediaPipe) | działa, zweryfikowane |
 | Ekstrakcja cech | zaimplementowane, do weryfikacji na żywo |
-| Kalibracja 12 pól + raport trafności | zaimplementowane, logika przetestowana na danych syntetycznych |
+| Kalibracja 12 pól (4 rundy, losowa kolejność) + raport trafności | zaimplementowane, logika przetestowana na danych syntetycznych |
 | Klasyfikacja pola + dwell activation | zaimplementowane, do weryfikacji na żywo |
 | Akcja po aktywacji pola | **nie zaimplementowane** — `on_zone_activated()` tylko wypisuje numer pola |
 
@@ -113,15 +113,27 @@ krzyżyki, zamień `IRIS_A` z `IRIS_B`** w sekcji KONFIGURACJA w `gaze_grid.py`.
 Bez tego kalibracja uczy się na przemieszanych cechach i wychodzi słabo bez
 widocznej przyczyny.
 
-**3. Kalibracja** — 12 pól × 40 próbek. Patrz kolejno na podświetlane pole:
+**3. Kalibracja** — 12 pól × 40 próbek, w 4 rundach po 10. Patrz na
+podświetlane pole; po każdej zmianie masz 0,6 s na przeniesienie wzroku, zanim
+zacznie się zbieranie próbek:
 
 ```bash
 .venv/bin/python gaze_grid.py --calibrate
 ```
 
-Na koniec wypisywana jest trafność na odłożonych próbkach i lista słabo
-rozpoznawanych pól. Poniżej ~70% warto poprawić oświetlenie, ustabilizować
-pozycję głowy i powtórzyć.
+Pola zapalają się w **losowej kolejności, innej w każdej rundzie**. Przy stałej
+kolejności 1→12 wszystko, co dryfuje w czasie kalibracji — osuwająca się głowa,
+zmiana światła, zmęczenie oczu — byłoby skorelowane z numerem pola, a model
+mógłby uczyć się dryfu zamiast spojrzenia.
+
+Na koniec wypisywana jest trafność i lista słabo rozpoznawanych pól. Poniżej
+~70% warto poprawić oświetlenie, ustabilizować pozycję głowy i powtórzyć.
+
+Trafność liczona jest na **całej odłożonej ostatniej rundzie**, nie na losowych
+próbkach. Próbki w obrębie jednej rundy to kolejne, niemal identyczne klatki —
+losowy podział rozdzielałby ich duplikaty między zbiór treningowy i testowy, a
+model rozpoznawałby klatki już widziane. Ta liczba jest więc niższa niż przy
+losowym podziale, ale jest uczciwym oszacowaniem zachowania na żywo.
 
 **4. Praca:**
 

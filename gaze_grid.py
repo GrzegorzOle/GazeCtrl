@@ -33,6 +33,7 @@ kamery/oswietlenia - klasyfikator jest per-uzytkownik i per-ustawienie.
 import argparse
 import os
 import pickle
+import random
 import time
 from collections import deque, Counter
 
@@ -55,6 +56,13 @@ DWELL_TIME_S = 0.7                          # czas patrzenia -> aktywacja pola
 SMOOTH_WINDOW = 7                           # glosowanie wiekszosciowe (klatki)
 MIN_CONFIDENCE = 0.55                       # prog pewnosci klasyfikatora
 SAMPLES_PER_ZONE = 40                       # probek kalibracyjnych na pole
+CALIB_ROUNDS = 4                            # rundy kalibracji; w kazdej pola w innej
+                                            # losowej kolejnosci. Rozrywa korelacje
+                                            # miedzy numerem pola a dryfem w czasie
+                                            # (osuwanie glowy, zmiana swiatla) i daje
+                                            # bloki do uczciwego odlozenia probek.
+SETTLE_TIME_S = 0.6                         # czas na przeniesienie wzroku po zmianie
+                                            # pola; klatki z sakady sa odrzucane
 
 MAX_READ_FAILURES = 30                      # kolejne nieudane klatki -> przerwij
 
@@ -241,12 +249,22 @@ class ZoneClassifier:
         self.clf.fit(X, y)
         self.trained = True
 
-    def fit_with_report(self, X, y):
+    def fit_with_report(self, X, y, groups=None):
         """Trenuje na czesci danych i zwraca trafnosc na odlozonym zbiorze,
         zeby uzytkownik od razu wiedzial, czy kalibracja sie udala. Finalny
-        model uczony jest ponownie na calosci - odlozone probki tez sa cenne."""
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X, y, test_size=0.25, stratify=y, random_state=0)
+        model uczony jest ponownie na calosci - odlozone probki tez sa cenne.
+
+        Odklada cala ostatnia runde kalibracji, a nie losowe probki. Probki w
+        obrebie jednej rundy to kolejne, niemal identyczne klatki - losowy
+        podzial rozdzielilby duplikaty na oba zbiory i zawyzal trafnosc."""
+        if groups is not None and len(np.unique(groups)) > 1:
+            held = np.unique(groups)[-1]
+            test_mask = groups == held
+            X_tr, X_te = X[~test_mask], X[test_mask]
+            y_tr, y_te = y[~test_mask], y[test_mask]
+        else:
+            X_tr, X_te, y_tr, y_te = train_test_split(
+                X, y, test_size=0.25, stratify=y, random_state=0)
         self.clf.fit(X_tr, y_tr)
         acc = float(self.clf.score(X_te, y_te))
         per_zone = {}
@@ -317,46 +335,64 @@ class DwellTracker:
 def run_calibration(cap, landmarker, screen_w, screen_h, fullscreen=True):
     screen_w, screen_h = open_grid_window("Kalibracja", screen_w, screen_h, fullscreen)
     rects = zone_rects(screen_w, screen_h)
-    X, y = [], []
+    X, y, groups = [], [], []
 
+    per_round = max(1, SAMPLES_PER_ZONE // CALIB_ROUNDS)
     read_failures = 0
 
-    for zone_idx in range(N_ZONES):
-        collected = 0
-        while collected < SAMPLES_PER_ZONE:
-            ok, frame = cap.read()
-            if not ok:
-                read_failures += 1
-                if read_failures >= MAX_READ_FAILURES:
+    for round_idx in range(CALIB_ROUNDS):
+        order = list(range(N_ZONES))
+        random.shuffle(order)
+
+        for zone_idx in order:
+            collected = 0
+            settle_until = time.time() + SETTLE_TIME_S
+
+            while collected < per_round:
+                ok, frame = cap.read()
+                if not ok:
+                    read_failures += 1
+                    if read_failures >= MAX_READ_FAILURES:
+                        cv2.destroyAllWindows()
+                        print(f"Kamera przestala zwracac klatki "
+                              f"({MAX_READ_FAILURES} nieudanych odczytow) - przerywam.")
+                        return None, None, None
+                    continue
+                read_failures = 0
+
+                settling = time.time() < settle_until
+
+                canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+                draw_grid(canvas, rects, active_zone=zone_idx,
+                          progress=0.0 if settling else collected / per_round)
+                status = ("Przenies wzrok na podswietlone pole..." if settling
+                          else "Patrz na podswietlone pole (ESC = przerwij)")
+                cv2.putText(canvas, status, (30, screen_h - 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+                cv2.putText(canvas, f"runda {round_idx + 1}/{CALIB_ROUNDS}",
+                            (30, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7, (150, 150, 150), 2)
+                cv2.imshow("Kalibracja", canvas)
+
+                # klatki z okresu przenoszenia wzroku lapia oko w trakcie sakady,
+                # wiec nie odpowiadaja jeszcze podswietlonemu polu
+                if not settling:
+                    result = landmarker.process(frame)
+                    if result is not None:
+                        landmarks, matrix = result
+                        feat = extract_features(landmarks, matrix,
+                                                frame.shape[1], frame.shape[0])
+                        X.append(feat)
+                        y.append(zone_idx)
+                        groups.append(round_idx)
+                        collected += 1
+
+                if cv2.waitKey(1) & 0xFF == 27:
                     cv2.destroyAllWindows()
-                    print(f"Kamera przestala zwracac klatki "
-                          f"({MAX_READ_FAILURES} nieudanych odczytow) - przerywam.")
-                    return None, None
-                continue
-            read_failures = 0
-
-            canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
-            draw_grid(canvas, rects, active_zone=zone_idx,
-                      progress=collected / SAMPLES_PER_ZONE)
-            cv2.putText(canvas, "Patrz na podswietlone pole (ESC = przerwij)",
-                        (30, screen_h - 30), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8, (200, 200, 200), 2)
-            cv2.imshow("Kalibracja", canvas)
-
-            result = landmarker.process(frame)
-            if result is not None:
-                landmarks, matrix = result
-                feat = extract_features(landmarks, matrix, frame.shape[1], frame.shape[0])
-                X.append(feat)
-                y.append(zone_idx)
-                collected += 1
-
-            if cv2.waitKey(1) & 0xFF == 27:
-                cv2.destroyAllWindows()
-                return None, None
+                    return None, None, None
 
     cv2.destroyAllWindows()
-    return np.array(X), np.array(y)
+    return np.array(X), np.array(y), np.array(groups)
 
 
 # ----------------------------------------------------------------------------
@@ -524,14 +560,14 @@ def main():
             run_debug(cap, landmarker)
 
         elif args.calibrate:
-            X, y = run_calibration(cap, landmarker, args.width, args.height,
-                                   fullscreen=not args.windowed)
+            X, y, groups = run_calibration(cap, landmarker, args.width, args.height,
+                                           fullscreen=not args.windowed)
             if X is not None:
                 clf = ZoneClassifier()
-                acc, per_zone = clf.fit_with_report(X, y)
+                acc, per_zone = clf.fit_with_report(X, y, groups)
                 clf.save()
                 print(f"\nKalibracja zapisana do {CALIB_MODEL_PATH} ({len(X)} probek).")
-                print(f"Trafnosc na odlozonych probkach: {acc:.1%}")
+                print(f"Trafnosc na odlozonej rundzie: {acc:.1%}")
                 weak = [z for z, a in per_zone.items() if a < 0.6]
                 if weak:
                     print("Slabo rozpoznawane pola: "
