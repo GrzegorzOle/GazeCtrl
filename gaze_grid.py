@@ -42,7 +42,9 @@ from typing import NamedTuple
 import cv2
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.neural_network import MLPClassifier
+from sklearn.neural_network import MLPClassifier, MLPRegressor
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
@@ -76,6 +78,26 @@ ENSEMBLE_SEEDS = 5                          # ile sieci tworzy zespol klasyfikat
 # czyli w dwoch rundach ZLY ZNAK. Korekta odejmowala wtedy wielkosc niezwiazana
 # z problemem. Nie da sie tego zalozyc z gory, wiec sprawdzamy za kazdym razem.
 DRIFT_MIN_GAIN = 0.02                       # 2 pkt proc.
+
+# O ile inny wariant musi pobic domyslny (klasyfikator bez korekty), zeby go
+# zastapic. Drugi wybor obok korekty dryfu to TYP GLOWICY:
+#
+#   klasyfikator - 12 nieporownywalnych etykiet, nie wie ze pole 5 lezy
+#                  miedzy 1 a 9
+#   regresor     - przewiduje (kolumna, wiersz) jako liczby ciagle i dopiero
+#                  potem przypisuje do pola, wiec korzysta z uporzadkowania
+#
+# Zmierzone na trzech kalibracjach z 19.07 (bez korekty dryfu, LORO):
+#
+#     sesja        klasyfikator   regresor    caly zysk siedzi w PIONIE
+#     popoludnie      82.5%        79.2%      -3.3   (wiersz -2.9)
+#     wieczor         72.1%        75.6%      +3.5   (wiersz +8.1)
+#     noc             55.6%        63.1%      +7.5   (wiersz +2.9)
+#
+# Regresor pomaga tam, gdzie sygnalu brakuje, i lekko szkodzi tam, gdzie go
+# starcza - typowy podpis regularyzacji. Zaden z wariantow nie wygrywa zawsze,
+# stad wybor per sesja zamiast decyzji raz na zawsze.
+VARIANT_MIN_GAIN = 0.02                     # 2 pkt proc.
 
 DWELL_TIME_S = 0.7                          # czas patrzenia -> aktywacja pola
 SMOOTH_WINDOW = 7                           # glosowanie wiekszosciowe (klatki)
@@ -402,16 +424,53 @@ class FaceLandmarker:
 # ----------------------------------------------------------------------------
 # KLASYFIKATOR POLA (trenowany per-uzytkownik podczas kalibracji)
 # ----------------------------------------------------------------------------
-def _build_mlp(seed):
+MLP_HIDDEN = (24, 16)
+
+# Srodki wszystkich pol we wspolrzednych siatki - uklad odniesienia regresora
+ZONE_CENTERS = np.array([[z % GRID_COLS, z // GRID_COLS]
+                         for z in range(N_ZONES)], dtype=float)
+
+# Szerokosc jadra zamieniajacego przewidziany punkt na rozklad po polach.
+# Dobrana tak, zeby pewnosc regresora miala podobna skale co prawdopodobienstwa
+# klasyfikatora - inaczej prog MIN_CONFIDENCE znaczylby co innego dla kazdego
+# wariantu i regresor po cichu przestalby aktywowac pola.
+REGRESSOR_SIGMA = 0.45
+
+
+def _build_mlp(seed, kind):
     """Jedno miejsce na architekture - raport i model finalny musza uczyc sie
     tak samo, inaczej raportowana liczba przestaje dotyczyc zapisanego modelu."""
-    return MLPClassifier(hidden_layer_sizes=(24, 16), max_iter=2000,
-                         random_state=seed)
+    if kind == "klasyfikator":
+        return MLPClassifier(hidden_layer_sizes=MLP_HIDDEN, max_iter=2000,
+                             random_state=seed)
+    # regresor przewiduje (kolumna, wiersz) jako liczby ciagle, wiec wymaga
+    # skalowania wejscia - inaczej nie schodzi z plaskiego minimum
+    return make_pipeline(StandardScaler(),
+                         MLPRegressor(hidden_layer_sizes=MLP_HIDDEN,
+                                      max_iter=2000, random_state=seed))
 
 
-def _ensemble_proba(models, X):
-    """Usredniony rozklad prawdopodobienstwa z calego zespolu."""
-    return np.mean([m.predict_proba(X) for m in models], axis=0)
+def _fit_ensemble(X, y, kind):
+    if kind == "klasyfikator":
+        return [_build_mlp(sd, kind).fit(X, y) for sd in range(ENSEMBLE_SEEDS)]
+    target = np.column_stack([y % GRID_COLS, y // GRID_COLS]).astype(float)
+    return [_build_mlp(sd, kind).fit(X, target) for sd in range(ENSEMBLE_SEEDS)]
+
+
+def _ensemble_proba(models, kind, X):
+    """Rozklad po WSZYSTKICH polach, w jednakowej postaci dla obu wariantow."""
+    if kind == "klasyfikator":
+        p = np.mean([m.predict_proba(X) for m in models], axis=0)
+        # runda treningowa moze nie zawierac ktoregos pola - rozklad musi i tak
+        # miec pelna szerokosc, bo indeksy kolumn to numery pol
+        pelne = np.zeros((len(p), N_ZONES))
+        pelne[:, models[0].classes_] = p
+        return pelne
+    # regresja: pole tym bardziej prawdopodobne, im blizej przewidzianego punktu
+    P = np.mean([m.predict(X) for m in models], axis=0)
+    d2 = ((P[:, None, :] - ZONE_CENTERS[None, :, :]) ** 2).sum(axis=2)
+    p = np.exp(-d2 / (2 * REGRESSOR_SIGMA ** 2))
+    return p / p.sum(axis=1, keepdims=True)
 
 
 class ZoneClassifier:
@@ -422,12 +481,15 @@ class ZoneClassifier:
         # zbija te wariancje i, co rownie wazne, sprawia ze raportowana po
         # kalibracji liczba dotyczy DOKLADNIE tego modelu, ktory zostaje
         # zapisany. Ziarna sa ustalone, wiec kalibracja pozostaje powtarzalna.
-        self.models = [_build_mlp(sd) for sd in range(ENSEMBLE_SEEDS)]
+        self.models = []
+        self.head_kind = "klasyfikator"
         self.trained = False
         self.last_acc_spread = 0.0
+        self.variants = {}          # wyniki wszystkich wariantow z ostatniej kalibracji
         self.drift_k = None         # (2, FEATURE_DIM) wplyw yaw/pitch na cechy
         self.drift_ref = None       # (2,) pozycja glowy odniesienia z kalibracji
         self.drift_gain = None      # ile korekta dala na odlozonych rundach
+        self.chosen_variant = ("klasyfikator", False)
 
     # -- korekta dryfu glowy --------------------------------------------------
     # Glowa dryfuje przez cala kalibracje i przesuwa cechy o ok. 10-18% calego
@@ -467,13 +529,14 @@ class ZoneClassifier:
             return X
         return X - (H - self.drift_ref) @ self.drift_k
 
-    def fit(self, X, y, H=None):
+    def fit(self, X, y, H=None, kind="klasyfikator"):
+        self.drift_k = self.drift_ref = None
         if H is not None:
             self.drift_k = self._fit_drift(X, H, y)
             self.drift_ref = H.mean(axis=0)
             X = self._apply_drift(X, H)
-        for m in self.models:
-            m.fit(X, y)
+        self.head_kind = kind
+        self.models = _fit_ensemble(X, y, kind)
         self.trained = True
 
     def fit_with_report(self, X, y, groups=None, H=None):
@@ -495,8 +558,10 @@ class ZoneClassifier:
         liczba dotyczy wiec tego modelu, ktorego uzywasz - nie sredniej po
         wariantach, ktorych nikt nie uruchomi.
 
-        Korekta dryfu glowy jest WLACZANA WARUNKOWO, osobno dla kazdej sesji -
-        patrz komentarz przy DRIFT_MIN_GAIN."""
+        Dwie decyzje zapadaja WARUNKOWO, osobno dla kazdej sesji: korekta dryfu
+        glowy i typ glowicy (klasyfikator albo regresor). Obie okazaly sie
+        pomagac w jednych sesjach i szkodzic w innych, wiec sprawdzamy je za
+        kazdym razem - patrz komentarze przy DRIFT_MIN_GAIN i VARIANT_MIN_GAIN."""
         if groups is not None and len(np.unique(groups)) > 1:
             folds = [(groups != h, groups == h) for h in np.unique(groups)]
         else:
@@ -505,19 +570,34 @@ class ZoneClassifier:
             mask_tr = np.zeros(len(y), bool); mask_tr[tr] = True
             folds = [(mask_tr, ~mask_tr)]
 
-        plain = self._loro(X, y, folds, None)
-        self.drift_gain = None
-        if H is None:
-            chosen, use_H = plain, None
-        else:
-            corrected = self._loro(X, y, folds, H)
-            self.drift_gain = corrected[0] - plain[0]
-            if self.drift_gain > DRIFT_MIN_GAIN:
-                chosen, use_H = corrected, H
-            else:
-                chosen, use_H = plain, None
+        # Wariant domyslny jest uprzywilejowany: zeby go zmienic, kandydat musi
+        # wygrac o VARIANT_MIN_GAIN. Bez tego progu wybieralibysmy zwyciezce
+        # szumu - cztery warianty na czterech foldach to sporo okazji do pomylki.
+        DOMYSLNY = ("klasyfikator", False)
+        self.variants = {}
+        for kind in ("klasyfikator", "regresor"):
+            for z_korekta in (False, True):
+                if z_korekta and H is None:
+                    continue
+                wynik = self._loro(X, y, folds, H if z_korekta else None, kind)
+                self.variants[(kind, z_korekta)] = wynik
 
-        acc, accs, y_te, pred = chosen
+        acc_domyslny = self.variants[DOMYSLNY][0]
+        najlepszy = max(self.variants, key=lambda v: self.variants[v][0])
+        if self.variants[najlepszy][0] - acc_domyslny > VARIANT_MIN_GAIN:
+            wybrany = najlepszy
+        else:
+            wybrany = DOMYSLNY
+        self.chosen_variant = wybrany
+        kind, z_korekta = wybrany
+        use_H = H if z_korekta else None
+        # ile dala korekta przy WYBRANYM typie glowicy - to jest liczba, ktora
+        # mowi cos o tej sesji; porownywanie w poprzek typow mieszaloby efekty
+        if H is not None:
+            self.drift_gain = (self.variants[(kind, True)][0]
+                               - self.variants[(kind, False)][0])
+
+        acc, accs, y_te, pred = self.variants[wybrany]
         # rozrzut MIEDZY RUNDAMI - to on mowi o powtarzalnosci kalibracji
         self.last_acc_spread = float(np.std(accs))
 
@@ -533,10 +613,10 @@ class ZoneClassifier:
                 if len(wrong):
                     top = Counter(wrong.tolist()).most_common(1)[0]
                     confusions[z] = (int(top[0]), top[1] / int(mask.sum()))
-        self.fit(X, y, use_H)       # finalny model: cale dane, wybrany wariant
+        self.fit(X, y, use_H, kind)  # finalny model: cale dane, wybrany wariant
         return acc, per_zone, confusions
 
-    def _loro(self, X, y, folds, H):
+    def _loro(self, X, y, folds, H, kind):
         """Jeden przebieg walidacji. Zwraca (trafnosc, per runda, y, predykcje)."""
         accs, y_true, y_pred = [], [], []
         for train_mask, test_mask in folds:
@@ -549,10 +629,8 @@ class ZoneClassifier:
                 Xtr = Xtr - (H[train_mask] - ref) @ k
                 Xte = Xte - (H[test_mask] - ref) @ k
             # oceniamy CALY zespol, tak samo jak potem dziala predict()
-            fold_models = [_build_mlp(sd).fit(Xtr, y[train_mask])
-                           for sd in range(ENSEMBLE_SEEDS)]
-            classes = fold_models[0].classes_
-            pred_fold = classes[_ensemble_proba(fold_models, Xte).argmax(axis=1)]
+            fold_models = _fit_ensemble(Xtr, y[train_mask], kind)
+            pred_fold = _ensemble_proba(fold_models, kind, Xte).argmax(axis=1)
             accs.append(float((pred_fold == y[test_mask]).mean()))
             y_true.append(y[test_mask])
             y_pred.append(pred_fold)
@@ -567,13 +645,14 @@ class ZoneClassifier:
         if self.drift_k is not None and head is not None:
             feat_vec = self._apply_drift(feat_vec[None, :],
                                          np.asarray(head, float)[None, :])[0]
-        probs = _ensemble_proba(self.models, [feat_vec])[0]
-        idx = int(np.argmax(probs))
-        return int(self.models[0].classes_[idx]), float(probs[idx])
+        probs = _ensemble_proba(self.models, self.head_kind, [feat_vec])[0]
+        zone = int(np.argmax(probs))
+        return zone, float(probs[zone])
 
     def save(self, path=CALIB_MODEL_PATH):
         with open(path, "wb") as f:
-            pickle.dump({"models": self.models, "drift_k": self.drift_k,
+            pickle.dump({"models": self.models, "head_kind": self.head_kind,
+                         "drift_k": self.drift_k,
                          "drift_ref": self.drift_ref}, f)
 
     def load(self, path=CALIB_MODEL_PATH):
@@ -582,12 +661,13 @@ class ZoneClassifier:
         # starsze modele to goly MLPClassifier albo slownik z pojedynczym "clf" -
         # bez zespolu i bez wspolczynnikow korekty dzialalyby dalej, ale gorzej
         # i po cichu, wiec odmawiamy zamiast po cichu tracic punkty
-        if not isinstance(blob, dict) or "models" not in blob:
+        if not isinstance(blob, dict) or "head_kind" not in blob:
             raise ValueError(
-                f"{path} pochodzi ze starszej wersji (brak zespolu sieci albo "
-                f"wspolczynnikow korekty dryfu glowy).\n"
+                f"{path} pochodzi ze starszej wersji (brak zespolu sieci, typu "
+                f"glowicy albo wspolczynnikow korekty dryfu glowy).\n"
                 f"Uruchom kalibracje ponownie: python gaze_grid.py --calibrate")
         self.models = blob["models"]
+        self.head_kind = blob["head_kind"]
         self.drift_k = blob["drift_k"]
         self.drift_ref = blob["drift_ref"]
         # model zapisany przed zmiana wektora cech dalby tu bardzo mylacy blad
@@ -927,13 +1007,17 @@ def main():
                       f"kalibracji).")
                 print(f"Trafnosc (srednia z {CALIB_ROUNDS} odlozonych rund): "
                       f"{acc:.1%} +-{clf.last_acc_spread:.1%}")
-                # Korekta dryfu bywa zawodna, wiec decyzja zapada per sesja -
-                # bez tej linii nie wiadomo, ktory wariant model faktycznie ma
-                if clf.drift_gain is not None:
-                    stan = "WLACZONA" if clf.drift_k is not None else "wylaczona"
-                    print(f"Korekta dryfu glowy: {stan} "
-                          f"({clf.drift_gain:+.1%} na odlozonych rundach, "
-                          f"prog {DRIFT_MIN_GAIN:+.0%})")
+                # Oba wybory bywaja zawodne i zapadaja per sesja - bez tego
+                # wydruku nie wiadomo, co model faktycznie w sobie ma
+                kind, z_korekta = clf.chosen_variant
+                print(f"Wybrany wariant: {kind}, korekta dryfu glowy "
+                      f"{'WLACZONA' if z_korekta else 'wylaczona'}")
+                print("  wszystkie sprawdzone warianty:")
+                for (k, kor), wynik in sorted(clf.variants.items(),
+                                              key=lambda t: -t[1][0]):
+                    znacznik = " <- wybrany" if (k, kor) == clf.chosen_variant else ""
+                    print(f"    {k:13s} korekta {'tak' if kor else 'nie'}: "
+                          f"{wynik[0]:5.1%}{znacznik}")
                 # Zawsze pokazujemy trzy najslabsze pola, nawet gdy sa przyzwoite.
                 # Przy samym progu raport milczal przy trafnosci 68% i nie bylo
                 # widac, ktore pola ciagna wynik w dol.
