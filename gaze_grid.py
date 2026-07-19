@@ -59,6 +59,24 @@ FEATURE_DIM = 4                             # ax, ay, bx, by (patrz extract_feat
 WEAK_ZONE_ACC = 0.8                         # ponizej tego pole uznajemy za slabe
                                             # i szukamy wzorca w pomylkach
 
+ENSEMBLE_SEEDS = 5                          # ile sieci tworzy zespol klasyfikatora.
+                                            # Pojedynczy MLP na 480 probkach zalezy
+                                            # od ziarna az do 12 pkt trafnosci
+
+# O ile korekta dryfu glowy musi poprawic trafnosc na odlozonych rundach, zeby
+# w ogole ja wlaczyc. Korekta jest ZAWODNA i decyzja musi zapadac per sesja:
+#
+#     kalibracja        bez korekty      z korekta      zmiana
+#     2026-07-19 pop.   82.5% +-10.9     86.9% +-7.4     +4.4
+#     2026-07-19 wiecz. 72.1%  +-8.8     80.8% +-0.6     +8.7
+#     2026-07-19 noc    55.6% +-10.4     43.8% +-22.9   -11.8
+#
+# W sesji nocnej dryf miedzyrundowy nie byl napedzany ruchem glowy - iloraz
+# "przesuniecie przewidziane / faktyczne" wyszedl +0.02, -0.20, -0.75, +0.35,
+# czyli w dwoch rundach ZLY ZNAK. Korekta odejmowala wtedy wielkosc niezwiazana
+# z problemem. Nie da sie tego zalozyc z gory, wiec sprawdzamy za kazdym razem.
+DRIFT_MIN_GAIN = 0.02                       # 2 pkt proc.
+
 DWELL_TIME_S = 0.7                          # czas patrzenia -> aktywacja pola
 SMOOTH_WINDOW = 7                           # glosowanie wiekszosciowe (klatki)
 MIN_CONFIDENCE = 0.55                       # prog pewnosci klasyfikatora
@@ -144,7 +162,14 @@ def extract_features(landmarks, transform_matrix, frame_w, frame_h) -> np.ndarra
 # ----------------------------------------------------------------------------
 # KAMERA
 # ----------------------------------------------------------------------------
-def open_camera(index):
+# Przy domyslnych 640x480 oko ma tylko ~30 px szerokosci, a teczowka ~14 px -
+# model teczowki dostaje wycinek, w ktorym nie ma czego powiekszac. Prosimy o
+# 720p; kamera moze odmowic i zejsc do swojego maksimum, dlatego czytamy
+# faktyczny rozmiar z powrotem zamiast zakladac, ze set() zadzialal.
+REQUESTED_WIDTH, REQUESTED_HEIGHT = 1280, 720
+
+
+def open_camera(index, width=REQUESTED_WIDTH, height=REQUESTED_HEIGHT):
     """Otwiera kamere i weryfikuje, ze faktycznie oddaje klatki.
 
     Sam VideoCapture.isOpened() nie wystarcza: urzadzenia typu kamera IR czy
@@ -154,6 +179,13 @@ def open_camera(index):
     if not cap.isOpened():
         cap.release()
         return None, f"Nie udalo sie otworzyc kamery o indeksie {index}."
+    if width and height:
+        # MJPG przed rozmiarem: przy nieskompresowanym YUYV pasmo USB zwykle
+        # ogranicza 720p do ~10 fps, a mniej klatek to mniej probek na runde
+        # kalibracji. Kolejnosc ma znaczenie - fourcc ustawiamy pierwszy.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     ok, frame = cap.read()
     if not ok or frame is None:
         cap.release()
@@ -370,21 +402,81 @@ class FaceLandmarker:
 # ----------------------------------------------------------------------------
 # KLASYFIKATOR POLA (trenowany per-uzytkownik podczas kalibracji)
 # ----------------------------------------------------------------------------
+def _build_mlp(seed):
+    """Jedno miejsce na architekture - raport i model finalny musza uczyc sie
+    tak samo, inaczej raportowana liczba przestaje dotyczyc zapisanego modelu."""
+    return MLPClassifier(hidden_layer_sizes=(24, 16), max_iter=2000,
+                         random_state=seed)
+
+
+def _ensemble_proba(models, X):
+    """Usredniony rozklad prawdopodobienstwa z calego zespolu."""
+    return np.mean([m.predict_proba(X) for m in models], axis=0)
+
+
 class ZoneClassifier:
     def __init__(self):
-        # random_state ustalony celowo: bez niego kazde uruchomienie kalibracji
-        # daje inny model i inna trafnosc, wiec nie da sie odroznic realnej
-        # poprawy od szumu inicjalizacji (rozrzut miedzy ziarnami siega 12 pkt)
-        self.clf = MLPClassifier(hidden_layer_sizes=(24, 16), max_iter=2000,
-                                 random_state=0)
+        # Zespol ENSEMBLE_SEEDS sieci roznacych sie tylko inicjalizacja, laczony
+        # przez usrednienie prawdopodobienstw. Pojedynczy MLP na tak malym
+        # zbiorze (480 probek) zalezy od ziarna az do 12 pkt trafnosci - zespol
+        # zbija te wariancje i, co rownie wazne, sprawia ze raportowana po
+        # kalibracji liczba dotyczy DOKLADNIE tego modelu, ktory zostaje
+        # zapisany. Ziarna sa ustalone, wiec kalibracja pozostaje powtarzalna.
+        self.models = [_build_mlp(sd) for sd in range(ENSEMBLE_SEEDS)]
         self.trained = False
         self.last_acc_spread = 0.0
+        self.drift_k = None         # (2, FEATURE_DIM) wplyw yaw/pitch na cechy
+        self.drift_ref = None       # (2,) pozycja glowy odniesienia z kalibracji
+        self.drift_gain = None      # ile korekta dala na odlozonych rundach
 
-    def fit(self, X, y):
-        self.clf.fit(X, y)
+    # -- korekta dryfu glowy --------------------------------------------------
+    # Glowa dryfuje przez cala kalibracje i przesuwa cechy o ok. 10-18% calego
+    # sygnalu odrozniajacego kolumny. Odejmujemy ten wplyw, szacujac go z
+    # wariacji WEWNATRZ pola: przy ustalonym polu spojrzenie jest stale, wiec
+    # to, co zostaje, pochodzi od samej glowy - dzieki temu korekta z definicji
+    # nie moze zjesc sygnalu odrozniajacego pola.
+    #
+    # Korygujemy WYLACZNIE ax. Zmierzone na dwoch niezaleznych kalibracjach:
+    #
+    #                      2026-07-19 pop.   2026-07-19 wiecz.
+    #     bez korekty        82.1% +-10.9      60.3% +-9.8
+    #     sam ax             86.4%  +-7.8      75.3% +-3.0
+    #     wszystkie 4        71.2% +-20.0      73.7% +-9.3
+    #
+    # Na cechach pionowych (ay, by) korekta przewiduje ZLY ZNAK przesuniecia
+    # w 3 rundach na 4 i potrafi zabrac 11 pkt - stad maska. bx wypada tak samo
+    # jak sam ax w granicach szumu, wiec zostawiamy wezszy wariant.
+    DRIFT_FEATURES = (0,)                   # indeksy w wektorze cech: ax
+
+    @staticmethod
+    def _fit_drift(X, H, y):
+        """Wspolczynniki k: jak cecha reaguje na glowe przy ustalonym polu."""
+        Xc, Hc = X.copy(), H.copy()
+        for z in np.unique(y):                # centrujemy obie strony w polu,
+            m = y == z                        # wiec miedzypolowy sygnal wypada
+            Xc[m] -= X[m].mean(axis=0)
+            Hc[m] -= H[m].mean(axis=0)
+        k, *_ = np.linalg.lstsq(Hc, Xc, rcond=None)
+        mask = np.ones(k.shape[1], bool)
+        mask[list(ZoneClassifier.DRIFT_FEATURES)] = False
+        k[:, mask] = 0.0                      # reszty cech nie ruszamy
+        return k
+
+    def _apply_drift(self, X, H):
+        if self.drift_k is None:
+            return X
+        return X - (H - self.drift_ref) @ self.drift_k
+
+    def fit(self, X, y, H=None):
+        if H is not None:
+            self.drift_k = self._fit_drift(X, H, y)
+            self.drift_ref = H.mean(axis=0)
+            X = self._apply_drift(X, H)
+        for m in self.models:
+            m.fit(X, y)
         self.trained = True
 
-    def fit_with_report(self, X, y, groups=None):
+    def fit_with_report(self, X, y, groups=None, H=None):
         """Trenuje na czesci danych i zwraca trafnosc na odlozonym zbiorze,
         zeby uzytkownik od razu wiedzial, czy kalibracja sie udala. Finalny
         model uczony jest ponownie na calosci - odlozone probki tez sa cenne.
@@ -396,7 +488,15 @@ class ZoneClassifier:
         Kazda runda sluzy po kolei jako zbior testowy, a wynik jest srednia.
         Pojedyncza odlozona runda daje wynik obarczony duzym rozrzutem
         (na zapisanych probkach +-11 pkt proc.), wiec latwo wziac szczesliwa
-        runde za poprawe."""
+        runde za poprawe.
+
+        W kazdym foldzie oceniany jest caly zespol ENSEMBLE_SEEDS sieci, czyli
+        dokladnie ta konstrukcja, ktora potem zostaje zapisana. Raportowana
+        liczba dotyczy wiec tego modelu, ktorego uzywasz - nie sredniej po
+        wariantach, ktorych nikt nie uruchomi.
+
+        Korekta dryfu glowy jest WLACZANA WARUNKOWO, osobno dla kazdej sesji -
+        patrz komentarz przy DRIFT_MIN_GAIN."""
         if groups is not None and len(np.unique(groups)) > 1:
             folds = [(groups != h, groups == h) for h in np.unique(groups)]
         else:
@@ -405,18 +505,21 @@ class ZoneClassifier:
             mask_tr = np.zeros(len(y), bool); mask_tr[tr] = True
             folds = [(mask_tr, ~mask_tr)]
 
-        accs, y_true, y_pred = [], [], []
-        for train_mask, test_mask in folds:
-            self.clf.fit(X[train_mask], y[train_mask])
-            pred_fold = self.clf.predict(X[test_mask])
-            accs.append(float((pred_fold == y[test_mask]).mean()))
-            y_true.append(y[test_mask])
-            y_pred.append(pred_fold)
+        plain = self._loro(X, y, folds, None)
+        self.drift_gain = None
+        if H is None:
+            chosen, use_H = plain, None
+        else:
+            corrected = self._loro(X, y, folds, H)
+            self.drift_gain = corrected[0] - plain[0]
+            if self.drift_gain > DRIFT_MIN_GAIN:
+                chosen, use_H = corrected, H
+            else:
+                chosen, use_H = plain, None
 
-        acc = float(np.mean(accs))
+        acc, accs, y_te, pred = chosen
+        # rozrzut MIEDZY RUNDAMI - to on mowi o powtarzalnosci kalibracji
         self.last_acc_spread = float(np.std(accs))
-        y_te = np.concatenate(y_true)
-        pred = np.concatenate(y_pred)
 
         per_zone, confusions = {}, {}
         for z in range(N_ZONES):
@@ -430,25 +533,66 @@ class ZoneClassifier:
                 if len(wrong):
                     top = Counter(wrong.tolist()).most_common(1)[0]
                     confusions[z] = (int(top[0]), top[1] / int(mask.sum()))
-        self.clf.fit(X, y)          # finalny model: cale dane
-        self.trained = True
+        self.fit(X, y, use_H)       # finalny model: cale dane, wybrany wariant
         return acc, per_zone, confusions
 
-    def predict(self, feat_vec):
-        probs = self.clf.predict_proba([feat_vec])[0]
-        zone = int(np.argmax(probs))
-        return zone, float(probs[zone])
+    def _loro(self, X, y, folds, H):
+        """Jeden przebieg walidacji. Zwraca (trafnosc, per runda, y, predykcje)."""
+        accs, y_true, y_pred = [], [], []
+        for train_mask, test_mask in folds:
+            Xtr, Xte = X[train_mask], X[test_mask]
+            if H is not None:
+                # k i punkt odniesienia WYLACZNIE z rund treningowych - liczone
+                # na calosci bylyby przeciekiem i zawyzalyby raportowana liczbe
+                k = self._fit_drift(Xtr, H[train_mask], y[train_mask])
+                ref = H[train_mask].mean(axis=0)
+                Xtr = Xtr - (H[train_mask] - ref) @ k
+                Xte = Xte - (H[test_mask] - ref) @ k
+            # oceniamy CALY zespol, tak samo jak potem dziala predict()
+            fold_models = [_build_mlp(sd).fit(Xtr, y[train_mask])
+                           for sd in range(ENSEMBLE_SEEDS)]
+            classes = fold_models[0].classes_
+            pred_fold = classes[_ensemble_proba(fold_models, Xte).argmax(axis=1)]
+            accs.append(float((pred_fold == y[test_mask]).mean()))
+            y_true.append(y[test_mask])
+            y_pred.append(pred_fold)
+        return (float(np.mean(accs)), accs,
+                np.concatenate(y_true), np.concatenate(y_pred))
+
+    def predict(self, feat_vec, head=None):
+        """`head` to (yaw, pitch) biezacej klatki - bez tego korekta dryfu jest
+        pomijana i model dostaje cechy w innej postaci niz te, na ktorych sie
+        uczyl, wiec trafnosc cicho spada."""
+        feat_vec = np.asarray(feat_vec, dtype=np.float32)
+        if self.drift_k is not None and head is not None:
+            feat_vec = self._apply_drift(feat_vec[None, :],
+                                         np.asarray(head, float)[None, :])[0]
+        probs = _ensemble_proba(self.models, [feat_vec])[0]
+        idx = int(np.argmax(probs))
+        return int(self.models[0].classes_[idx]), float(probs[idx])
 
     def save(self, path=CALIB_MODEL_PATH):
         with open(path, "wb") as f:
-            pickle.dump(self.clf, f)
+            pickle.dump({"models": self.models, "drift_k": self.drift_k,
+                         "drift_ref": self.drift_ref}, f)
 
     def load(self, path=CALIB_MODEL_PATH):
         with open(path, "rb") as f:
-            self.clf = pickle.load(f)
+            blob = pickle.load(f)
+        # starsze modele to goly MLPClassifier albo slownik z pojedynczym "clf" -
+        # bez zespolu i bez wspolczynnikow korekty dzialalyby dalej, ale gorzej
+        # i po cichu, wiec odmawiamy zamiast po cichu tracic punkty
+        if not isinstance(blob, dict) or "models" not in blob:
+            raise ValueError(
+                f"{path} pochodzi ze starszej wersji (brak zespolu sieci albo "
+                f"wspolczynnikow korekty dryfu glowy).\n"
+                f"Uruchom kalibracje ponownie: python gaze_grid.py --calibrate")
+        self.models = blob["models"]
+        self.drift_k = blob["drift_k"]
+        self.drift_ref = blob["drift_ref"]
         # model zapisany przed zmiana wektora cech dalby tu bardzo mylacy blad
         # gdzies w glebi sklearn, zamiast powiedziec wprost, co jest nie tak
-        n = getattr(self.clf, "n_features_in_", FEATURE_DIM)
+        n = getattr(self.models[0], "n_features_in_", FEATURE_DIM)
         if n != FEATURE_DIM:
             raise ValueError(
                 f"{path} pochodzi ze starszej wersji (model oczekuje {n} cech, "
@@ -636,11 +780,19 @@ def run_debug(cap, landmarker):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
             feat = extract_features(landmarks, matrix, w, h)
+            # yaw/pitch NIE sa czescia wektora cech (zakodowalyby dryf miedzy
+            # rundami) - bierzemy je wprost z macierzy, bo w podgladzie chodzi
+            # o obserwowanie tego dryfu na zywo.
+            yaw, pitch = rotation_to_yaw_pitch(matrix)[:2]
             cv2.putText(frame,
                         f"A: {feat[0]:+.2f},{feat[1]:+.2f}  "
                         f"B: {feat[2]:+.2f},{feat[3]:+.2f}  "
-                        f"yaw/pitch: {feat[4]:+.2f},{feat[5]:+.2f}",
+                        f"yaw/pitch: {yaw:+.3f},{pitch:+.3f}",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
+            # szerokosc oka w px - kontrola, czy kamera faktycznie dala 720p
+            eye_px = np.linalg.norm(pts[EYE_A_CORNERS[1]] - pts[EYE_A_CORNERS[0]])
+            cv2.putText(frame, f"klatka: {w}x{h}   oko: {eye_px:.0f} px",
+                        (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
 
         cv2.putText(frame, "ESC = wyjscie", (10, frame.shape[0] - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (150, 150, 150), 1)
@@ -685,7 +837,7 @@ def run_live(cap, landmarker, classifier, screen_w, screen_h, fullscreen=True):
         if result is not None:
             landmarks, matrix = result
             feat = extract_features(landmarks, matrix, frame.shape[1], frame.shape[0])
-            zone, conf = classifier.predict(feat)
+            zone, conf = classifier.predict(feat, rotation_to_yaw_pitch(matrix))
 
         active_zone, progress = tracker.update(zone, conf)
         draw_grid(canvas, rects, active_zone=active_zone, progress=progress)
@@ -764,8 +916,9 @@ def main():
                                       settle_time=args.settle)
             if samples is not None:
                 X, y, groups = samples.X, samples.y, samples.groups
+                H = np.array([rotation_to_yaw_pitch(m) for m in samples.matrices])
                 clf = ZoneClassifier()
-                acc, per_zone, confusions = clf.fit_with_report(X, y, groups)
+                acc, per_zone, confusions = clf.fit_with_report(X, y, groups, H)
                 clf.save()
                 np.savez_compressed(CALIB_DATA_PATH, **samples._asdict())
                 print(f"\nKalibracja zapisana do {CALIB_MODEL_PATH} ({len(X)} probek).")
@@ -774,6 +927,13 @@ def main():
                       f"kalibracji).")
                 print(f"Trafnosc (srednia z {CALIB_ROUNDS} odlozonych rund): "
                       f"{acc:.1%} +-{clf.last_acc_spread:.1%}")
+                # Korekta dryfu bywa zawodna, wiec decyzja zapada per sesja -
+                # bez tej linii nie wiadomo, ktory wariant model faktycznie ma
+                if clf.drift_gain is not None:
+                    stan = "WLACZONA" if clf.drift_k is not None else "wylaczona"
+                    print(f"Korekta dryfu glowy: {stan} "
+                          f"({clf.drift_gain:+.1%} na odlozonych rundach, "
+                          f"prog {DRIFT_MIN_GAIN:+.0%})")
                 # Zawsze pokazujemy trzy najslabsze pola, nawet gdy sa przyzwoite.
                 # Przy samym progu raport milczal przy trafnosci 68% i nie bylo
                 # widac, ktore pola ciagna wynik w dol.
