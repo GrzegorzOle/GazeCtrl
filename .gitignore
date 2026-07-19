@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Model MediaPipe - pobierany lokalnie (patrz naglowek gaze_grid.py)
+face_landmarker.task
+
+# Kalibracja jest per-uzytkownik i per-ustawienie kamery
+calibration_model.pkl
