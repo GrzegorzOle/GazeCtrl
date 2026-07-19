@@ -31,11 +31,13 @@ kamery/oswietlenia - klasyfikator jest per-uzytkownik i per-ustawienie.
 """
 
 import argparse
+import glob
 import os
 import pickle
 import random
 import time
 from collections import deque, Counter
+from typing import NamedTuple
 
 import cv2
 import numpy as np
@@ -51,6 +53,12 @@ from mediapipe.tasks.python import vision as mp_vision
 # ----------------------------------------------------------------------------
 GRID_ROWS, GRID_COLS = 3, 4                 # 3x4 = 12 pol
 N_ZONES = GRID_ROWS * GRID_COLS
+
+# na oko: pozycja tesczowki (poziom, pion) + pion wzgledem powieki + rozwarcie
+FEATURE_DIM = 8                             # patrz extract_features
+
+WEAK_ZONE_ACC = 0.8                         # ponizej tego pole uznajemy za slabe
+                                            # i szukamy wzorca w pomylkach
 
 DWELL_TIME_S = 0.7                          # czas patrzenia -> aktywacja pola
 SMOOTH_WINDOW = 7                           # glosowanie wiekszosciowe (klatki)
@@ -80,6 +88,8 @@ CALIB_DATA_PATH = "calibration_data.npz"    # surowe probki - pozwalaja analizow
 # debug_draw_landmarks) - w razie potrzeby po prostu zamien pary miejscami.
 EYE_A_CORNERS = (33, 133)
 EYE_B_CORNERS = (362, 263)
+EYE_A_LIDS = (159, 145)                     # gorna, dolna powieka
+EYE_B_LIDS = (386, 374)
 IRIS_A = [469, 470, 471, 472]
 IRIS_B = [474, 475, 476, 477]
 
@@ -98,11 +108,17 @@ def rotation_to_yaw_pitch(matrix_4x4: np.ndarray):
 
 
 def extract_features(landmarks, transform_matrix, frame_w, frame_h) -> np.ndarray:
-    """Wektor cech: wzgledna pozycja tesczowki w kazdym oku (poziomo/pionowo)
-    + przyblizona orientacja glowy (yaw/pitch)."""
-    pts = np.array([[lm.x * frame_w, lm.y * frame_h] for lm in landmarks])
+    """Wektor cech: wzgledna pozycja tesczowki w kazdym oku (poziomo/pionowo).
 
-    def iris_ratio(iris_idx, corner_idx):
+    `landmarks` to albo obiekty MediaPipe (.x/.y), albo tablica (N, 2+) ze
+    znormalizowanymi wspolrzednymi - ta druga postac siedzi w calibration_data.npz
+    i pozwala przeliczyc nowy wektor cech bez powtarzania kalibracji."""
+    if isinstance(landmarks, np.ndarray):
+        pts = landmarks[:, :2] * np.array([frame_w, frame_h])
+    else:
+        pts = np.array([[lm.x * frame_w, lm.y * frame_h] for lm in landmarks])
+
+    def iris_ratio(iris_idx, corner_idx, lid_idx):
         iris_c = pts[iris_idx].mean(axis=0)
         c1, c2 = pts[corner_idx[0]], pts[corner_idx[1]]
         eye_vec = c2 - c1
@@ -110,13 +126,25 @@ def extract_features(landmarks, transform_matrix, frame_w, frame_h) -> np.ndarra
         t = np.dot(iris_c - c1, eye_vec) / (eye_len ** 2)      # poziomo: ~0..1
         eye_mid = (c1 + c2) / 2
         v = (iris_c[1] - eye_mid[1]) / eye_len                  # pionowo
-        return t, v
 
-    ax, ay = iris_ratio(IRIS_A, EYE_A_CORNERS)
-    bx, by = iris_ratio(IRIS_B, EYE_B_CORNERS)
-    yaw, pitch = rotation_to_yaw_pitch(transform_matrix)
+        # Powieka niesie osobny trop o pionie: patrzenie w dol ja przymyka.
+        # Rozwarcie i polozenie tesczowki wzgledem szpary powiekowej dopiero
+        # razem daja zysk - kazde z osobna nie poprawia nic (patrz naglowek).
+        upper, lower = pts[lid_idx[0]], pts[lid_idx[1]]
+        aperture = np.linalg.norm(upper - lower)
+        lid_v = (iris_c[1] - (upper[1] + lower[1]) / 2) / (aperture + 1e-6)
+        return t, v, lid_v, aperture / eye_len
 
-    return np.array([ax, ay, bx, by, yaw, pitch], dtype=np.float32)
+    ax, ay, a_lid, a_ap = iris_ratio(IRIS_A, EYE_A_CORNERS, EYE_A_LIDS)
+    bx, by, b_lid, b_ap = iris_ratio(IRIS_B, EYE_B_CORNERS, EYE_B_LIDS)
+
+    # yaw/pitch glowy celowo NIE wchodza do wektora cech. Miały kompensowac
+    # ruch glowy, ale przy w miare nieruchomej glowie koduja glownie dryf
+    # miedzy rundami kalibracji - model chwyta sie ich i przestaje uogolniac
+    # na nowa runde. Sama pozycja tesczowki wzgledem kacikow oka jest juz
+    # z definicji odporna na pozycje glowy.
+    return np.array([ax, ay, a_lid, a_ap,
+                     bx, by, b_lid, b_ap], dtype=np.float32)
 
 
 # ----------------------------------------------------------------------------
@@ -164,6 +192,26 @@ def list_cameras(max_index=10):
 # ----------------------------------------------------------------------------
 # SIATKA EKRANU (12 POL)
 # ----------------------------------------------------------------------------
+def detect_screen_size():
+    """Rozdzielczosc podlaczonego ekranu z /sys/class/drm, albo (0, 0).
+
+    Czytane wprost z jadra, wiec dziala tak samo pod Wayland i X11 i nie
+    wymaga dodatkowej zaleznosci. Przy kilku ekranach bierze pierwszy
+    podlaczony - siatka i tak jest sensowna tylko na jednym."""
+    try:
+        for status in sorted(glob.glob("/sys/class/drm/card*/status")):
+            if open(status).read().strip() != "connected":
+                continue
+            modes = os.path.join(os.path.dirname(status), "modes")
+            first = open(modes).readline().strip()
+            if "x" in first:
+                w, h = first.split("x")[:2]
+                return int(w), int(h)
+    except (OSError, ValueError):
+        pass
+    return 0, 0
+
+
 def open_grid_window(name, fallback_w, fallback_h, fullscreen=True):
     """Otwiera okno siatki i zwraca jego realny rozmiar w pikselach.
 
@@ -178,8 +226,16 @@ def open_grid_window(name, fallback_w, fallback_h, fullscreen=True):
         cv2.resizeWindow(name, fallback_w, fallback_h)
         return fallback_w, fallback_h
 
+    # Plotno zasiewajace musi miec proporcje ekranu. OpenCV wpasowuje obraz
+    # w okno z zachowaniem proporcji, wiec obraz 16:9 na ekranie 16:10 zostaje
+    # otoczony pasami tla, a getWindowImageRect zwraca wtedy rozmiar samego
+    # wpasowanego obrazu - siatka utknelaby w zlych proporcjach na stale.
+    seed_w, seed_h = detect_screen_size()
+    if seed_w <= 0:
+        seed_w, seed_h = fallback_w, fallback_h
+
     # okno musi sie raz wyrenderowac, zanim poda swoj rozmiar
-    cv2.imshow(name, np.zeros((fallback_h, fallback_w, 3), dtype=np.uint8))
+    cv2.imshow(name, np.zeros((seed_h, seed_w, 3), dtype=np.uint8))
     cv2.waitKey(200)
     try:
         _, _, w, h = cv2.getWindowImageRect(name)
@@ -187,9 +243,9 @@ def open_grid_window(name, fallback_w, fallback_h, fullscreen=True):
         w = h = 0
 
     if w <= 0 or h <= 0:
-        print(f"Nie udalo sie odczytac rozmiaru ekranu - uzywam "
-              f"{fallback_w}x{fallback_h}. Mozesz podac wlasny: --width/--height")
-        return fallback_w, fallback_h
+        print(f"Nie udalo sie odczytac rozmiaru okna - uzywam "
+              f"{seed_w}x{seed_h}. Mozesz podac wlasny: --width/--height")
+        return seed_w, seed_h
     return w, h
 
 
@@ -322,8 +378,13 @@ class FaceLandmarker:
 # ----------------------------------------------------------------------------
 class ZoneClassifier:
     def __init__(self):
-        self.clf = MLPClassifier(hidden_layer_sizes=(24, 16), max_iter=2000)
+        # random_state ustalony celowo: bez niego kazde uruchomienie kalibracji
+        # daje inny model i inna trafnosc, wiec nie da sie odroznic realnej
+        # poprawy od szumu inicjalizacji (rozrzut miedzy ziarnami siega 12 pkt)
+        self.clf = MLPClassifier(hidden_layer_sizes=(24, 16), max_iter=2000,
+                                 random_state=0)
         self.trained = False
+        self.last_acc_spread = 0.0
 
     def fit(self, X, y):
         self.clf.fit(X, y)
@@ -334,21 +395,36 @@ class ZoneClassifier:
         zeby uzytkownik od razu wiedzial, czy kalibracja sie udala. Finalny
         model uczony jest ponownie na calosci - odlozone probki tez sa cenne.
 
-        Odklada cala ostatnia runde kalibracji, a nie losowe probki. Probki w
-        obrebie jednej rundy to kolejne, niemal identyczne klatki - losowy
-        podzial rozdzielilby duplikaty na oba zbiory i zawyzal trafnosc."""
+        Odklada cale rundy kalibracji, a nie losowe probki. Probki w obrebie
+        jednej rundy to kolejne, niemal identyczne klatki - losowy podzial
+        rozdzielilby duplikaty na oba zbiory i zawyzal trafnosc.
+
+        Kazda runda sluzy po kolei jako zbior testowy, a wynik jest srednia.
+        Pojedyncza odlozona runda daje wynik obarczony duzym rozrzutem
+        (na zapisanych probkach +-11 pkt proc.), wiec latwo wziac szczesliwa
+        runde za poprawe."""
         if groups is not None and len(np.unique(groups)) > 1:
-            held = np.unique(groups)[-1]
-            test_mask = groups == held
-            X_tr, X_te = X[~test_mask], X[test_mask]
-            y_tr, y_te = y[~test_mask], y[test_mask]
+            folds = [(groups != h, groups == h) for h in np.unique(groups)]
         else:
-            X_tr, X_te, y_tr, y_te = train_test_split(
-                X, y, test_size=0.25, stratify=y, random_state=0)
-        self.clf.fit(X_tr, y_tr)
-        acc = float(self.clf.score(X_te, y_te))
+            tr, te = train_test_split(np.arange(len(y)), test_size=0.25,
+                                      stratify=y, random_state=0)
+            mask_tr = np.zeros(len(y), bool); mask_tr[tr] = True
+            folds = [(mask_tr, ~mask_tr)]
+
+        accs, y_true, y_pred = [], [], []
+        for train_mask, test_mask in folds:
+            self.clf.fit(X[train_mask], y[train_mask])
+            pred_fold = self.clf.predict(X[test_mask])
+            accs.append(float((pred_fold == y[test_mask]).mean()))
+            y_true.append(y[test_mask])
+            y_pred.append(pred_fold)
+
+        acc = float(np.mean(accs))
+        self.last_acc_spread = float(np.std(accs))
+        y_te = np.concatenate(y_true)
+        pred = np.concatenate(y_pred)
+
         per_zone, confusions = {}, {}
-        pred = self.clf.predict(X_te)
         for z in range(N_ZONES):
             mask = y_te == z
             if mask.any():
@@ -376,6 +452,14 @@ class ZoneClassifier:
     def load(self, path=CALIB_MODEL_PATH):
         with open(path, "rb") as f:
             self.clf = pickle.load(f)
+        # model zapisany przed zmiana wektora cech dalby tu bardzo mylacy blad
+        # gdzies w glebi sklearn, zamiast powiedziec wprost, co jest nie tak
+        n = getattr(self.clf, "n_features_in_", FEATURE_DIM)
+        if n != FEATURE_DIM:
+            raise ValueError(
+                f"{path} pochodzi ze starszej wersji (model oczekuje {n} cech, "
+                f"program wylicza {FEATURE_DIM}).\n"
+                f"Uruchom kalibracje ponownie: python gaze_grid.py --calibrate")
         self.trained = True
 
 
@@ -419,11 +503,26 @@ class DwellTracker:
 # ----------------------------------------------------------------------------
 # KALIBRACJA
 # ----------------------------------------------------------------------------
+class CalibrationSamples(NamedTuple):
+    """Plon kalibracji: gotowe cechy + surowiec do ich ponownego wyliczenia."""
+    X: np.ndarray            # (n, FEATURE_DIM) cechy wg biezacego extract_features
+    y: np.ndarray            # (n,) indeks pola
+    groups: np.ndarray       # (n,) numer rundy - do walidacji leave-one-round-out
+    landmarks: np.ndarray    # (n, 478, 3) znormalizowane wspolrzedne twarzy
+    matrices: np.ndarray     # (n, 4, 4) macierze transformacji glowy
+    frame_size: np.ndarray   # (2,) szerokosc, wysokosc klatki z kamery
+
+
 def run_calibration(cap, landmarker, screen_w, screen_h, fullscreen=True,
                     settle_time=SETTLE_TIME_S):
     screen_w, screen_h = open_grid_window("Kalibracja", screen_w, screen_h, fullscreen)
     rects = zone_rects(screen_w, screen_h)
     X, y, groups = [], [], []
+    # Surowe landmarki i macierze glowy odkladane obok gotowych cech. Dzieki nim
+    # nowy pomysl na wektor cech da sie przeliczyc na tych samych probkach,
+    # zamiast powtarzac kalibracje przed kamera przy kazdej zmianie.
+    raw_lm, raw_mat = [], []
+    frame_size = None
 
     per_round = max(1, SAMPLES_PER_ZONE // CALIB_ROUNDS)
     read_failures = 0
@@ -444,7 +543,7 @@ def run_calibration(cap, landmarker, screen_w, screen_h, fullscreen=True,
                         cv2.destroyAllWindows()
                         print(f"Kamera przestala zwracac klatki "
                               f"({MAX_READ_FAILURES} nieudanych odczytow) - przerywam.")
-                        return None, None, None
+                        return None
                     continue
                 read_failures = 0
 
@@ -478,14 +577,23 @@ def run_calibration(cap, landmarker, screen_w, screen_h, fullscreen=True,
                         X.append(feat)
                         y.append(zone_idx)
                         groups.append(round_idx)
+                        # wspolrzedne znormalizowane (0..1) - razem z frame_size
+                        # pozwalaja odtworzyc wejscie extract_features co do piksela
+                        raw_lm.append([(lm.x, lm.y, lm.z) for lm in landmarks])
+                        raw_mat.append(matrix)
+                        frame_size = (frame.shape[1], frame.shape[0])
                         collected += 1
 
                 if cv2.waitKey(1) & 0xFF == 27:
                     cv2.destroyAllWindows()
-                    return None, None, None
+                    return None
 
     cv2.destroyAllWindows()
-    return np.array(X), np.array(y), np.array(groups)
+    return CalibrationSamples(
+        X=np.array(X), y=np.array(y), groups=np.array(groups),
+        landmarks=np.array(raw_lm, dtype=np.float32),
+        matrices=np.array(raw_mat, dtype=np.float32),
+        frame_size=np.array(frame_size or (0, 0), dtype=np.int32))
 
 
 # ----------------------------------------------------------------------------
@@ -657,27 +765,34 @@ def main():
             run_debug(cap, landmarker)
 
         elif args.calibrate:
-            X, y, groups = run_calibration(cap, landmarker, args.width, args.height,
-                                           fullscreen=not args.windowed,
-                                           settle_time=args.settle)
-            if X is not None:
+            samples = run_calibration(cap, landmarker, args.width, args.height,
+                                      fullscreen=not args.windowed,
+                                      settle_time=args.settle)
+            if samples is not None:
+                X, y, groups = samples.X, samples.y, samples.groups
                 clf = ZoneClassifier()
                 acc, per_zone, confusions = clf.fit_with_report(X, y, groups)
                 clf.save()
-                np.savez(CALIB_DATA_PATH, X=X, y=y, groups=groups)
+                np.savez_compressed(CALIB_DATA_PATH, **samples._asdict())
                 print(f"\nKalibracja zapisana do {CALIB_MODEL_PATH} ({len(X)} probek).")
-                print(f"Probki zapisane do {CALIB_DATA_PATH} (do analizy bez "
-                      f"powtarzania kalibracji).")
-                print(f"Trafnosc na odlozonej rundzie: {acc:.1%}")
-                weak = sorted(z for z, a in per_zone.items() if a < 0.6)
+                print(f"Probki zapisane do {CALIB_DATA_PATH} (cechy + surowe "
+                      f"landmarki - nowy wektor cech przeliczysz bez powtarzania "
+                      f"kalibracji).")
+                print(f"Trafnosc (srednia z {CALIB_ROUNDS} odlozonych rund): "
+                      f"{acc:.1%} +-{clf.last_acc_spread:.1%}")
+                # Zawsze pokazujemy trzy najslabsze pola, nawet gdy sa przyzwoite.
+                # Przy samym progu raport milczal przy trafnosci 68% i nie bylo
+                # widac, ktore pola ciagna wynik w dol.
+                ranking = sorted(per_zone.items(), key=lambda t: t[1])[:3]
+                print("\nNajslabsze pola (pole: trafnosc -> najczestsza pomylka):")
+                for z, a in ranking:
+                    line = f"  pole {z + 1}: {a:.0%}"
+                    if z in confusions:
+                        other, share = confusions[z]
+                        line += f" -> mylone z polem {other + 1} ({share:.0%} probek)"
+                    print(line)
+                weak = sorted(z for z, a in per_zone.items() if a < WEAK_ZONE_ACC)
                 if weak:
-                    print("\nSlabo rozpoznawane pola (pole: trafnosc -> najczestsza pomylka):")
-                    for z in weak:
-                        line = f"  pole {z + 1}: {per_zone[z]:.0%}"
-                        if z in confusions:
-                            other, share = confusions[z]
-                            line += f" -> mylone z polem {other + 1} ({share:.0%} probek)"
-                        print(line)
                     print(describe_confusion_pattern(weak, confusions))
                 if acc < 0.7:
                     print("UWAGA: niska trafnosc. Sprobuj poprawic oswietlenie, "
