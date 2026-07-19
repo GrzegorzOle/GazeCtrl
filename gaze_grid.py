@@ -210,6 +210,13 @@ def describe_confusion_pattern(weak, confusions):
     pod katem), a obok siebie - na poziom (yaw, zbyt waskie kolumny).
     To tylko heurystyka na podstawie dominujacego kierunku, nie diagnoza.
     """
+    # przy jednym-dwoch slabych polach "dominujacy kierunek" to pojedyncza
+    # pomylka, a nie wzorzec - sugerowanie na tej podstawie przebudowy siatki
+    # byloby myleniem szumu z geometria
+    if len(weak) < 3:
+        return ("\nZa malo slabych pol, zeby mowic o wzorcu - to raczej lokalny\n"
+                "szum niz blad geometrii siatki.")
+
     vertical = horizontal = diagonal = 0
     for z in weak:
         if z not in confusions:
