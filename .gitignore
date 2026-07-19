@@ -8,3 +8,4 @@ face_landmarker.task
 
 # Kalibracja jest per-uzytkownik i per-ustawienie kamery
 calibration_model.pkl
+calibration_data.npz

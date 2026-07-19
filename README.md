@@ -114,8 +114,10 @@ Bez tego kalibracja uczy się na przemieszanych cechach i wychodzi słabo bez
 widocznej przyczyny.
 
 **3. Kalibracja** — 12 pól × 40 próbek, w 4 rundach po 10. Patrz na
-podświetlane pole; po każdej zmianie masz 0,6 s na przeniesienie wzroku, zanim
-zacznie się zbieranie próbek:
+podświetlane pole; po każdej zmianie masz 1,5 s na przeniesienie wzroku
+(z odliczaniem w polu), zanim zacznie się zbieranie próbek. Jeśli to za szybko,
+zwiększ `--settle 2.5` — lepiej kalibrować dłużej niż zbierać próbki, w których
+wzrok jest jeszcze w drodze:
 
 ```bash
 .venv/bin/python gaze_grid.py --calibrate
@@ -126,8 +128,15 @@ kolejności 1→12 wszystko, co dryfuje w czasie kalibracji — osuwająca się 
 zmiana światła, zmęczenie oczu — byłoby skorelowane z numerem pola, a model
 mógłby uczyć się dryfu zamiast spojrzenia.
 
-Na koniec wypisywana jest trafność i lista słabo rozpoznawanych pól. Poniżej
-~70% warto poprawić oświetlenie, ustabilizować pozycję głowy i powtórzyć.
+Na koniec wypisywana jest trafność, lista słabo rozpoznawanych pól i **z czym
+każde z nich jest mylone**. Kierunek pomyłek mówi więcej niż sama trafność:
+pomyłki w pionie (pole mylone z tym nad nim) wskazują na kąt kamery i słabszy
+sygnał pitch, pomyłki w poziomie — na zbyt wąskie kolumny, a brak wyraźnego
+kierunku na ogólny szum (światło, odbicia w okularach). Poniżej ~70% warto
+zadziałać zgodnie z tą podpowiedzią i powtórzyć.
+
+Surowe próbki lądują w `calibration_data.npz`, więc nieudaną kalibrację można
+analizować bez powtarzania jej.
 
 Trafność liczona jest na **całej odłożonej ostatniej rundzie**, nie na losowych
 próbkach. Próbki w obrębie jednej rundy to kolejne, niemal identyczne klatki —
@@ -174,6 +183,7 @@ AAC.
 | `requirements.txt` | zależności |
 | `face_landmarker.task` | model MediaPipe, pobierany osobno (poza repo) |
 | `calibration_model.pkl` | wynik kalibracji, tworzony lokalnie (poza repo) |
+| `calibration_data.npz` | surowe próbki kalibracyjne, do analizy (poza repo) |
 
 Model i kalibracja są celowo poza repozytorium: model jest pobieralny, a
 kalibracja dotyczy konkretnej osoby i konkretnego ustawienia kamery.

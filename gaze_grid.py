@@ -61,13 +61,18 @@ CALIB_ROUNDS = 4                            # rundy kalibracji; w kazdej pola w 
                                             # miedzy numerem pola a dryfem w czasie
                                             # (osuwanie glowy, zmiana swiatla) i daje
                                             # bloki do uczciwego odlozenia probek.
-SETTLE_TIME_S = 0.6                         # czas na przeniesienie wzroku po zmianie
-                                            # pola; klatki z sakady sa odrzucane
+SETTLE_TIME_S = 1.5                         # czas na przeniesienie wzroku po zmianie
+                                            # pola; klatki z sakady sa odrzucane.
+                                            # Musi wystarczyc nie tylko na sakade
+                                            # (~50 ms), ale na zauwazenie zmiany i
+                                            # spokojne skupienie wzroku.
 
 MAX_READ_FAILURES = 30                      # kolejne nieudane klatki -> przerwij
 
 MODEL_TASK_PATH = "face_landmarker.task"
 CALIB_MODEL_PATH = "calibration_model.pkl"
+CALIB_DATA_PATH = "calibration_data.npz"    # surowe probki - pozwalaja analizowac
+                                            # nieudana kalibracje bez powtarzania jej
 
 # Indeksy landmarkow MediaPipe (478 pkt, tesczowki = 468-477).
 # UWAGA: przypisanie oko<->tesczowka jest zgodne z powszechna konwencja
@@ -197,6 +202,42 @@ def zone_rects(screen_w, screen_h):
     return rects
 
 
+def describe_confusion_pattern(weak, confusions):
+    """Podpowiedz, w ktora strone szukac przyczyny slabych pol.
+
+    Kierunek pomylek niesie inna informacje niz sama trafnosc: mylenie pol
+    lezacych nad soba wskazuje na pion (kompensacja pitch, kamera patrzaca
+    pod katem), a obok siebie - na poziom (yaw, zbyt waskie kolumny).
+    To tylko heurystyka na podstawie dominujacego kierunku, nie diagnoza.
+    """
+    vertical = horizontal = diagonal = 0
+    for z in weak:
+        if z not in confusions:
+            continue
+        other = confusions[z][0]
+        same_row = z // GRID_COLS == other // GRID_COLS
+        same_col = z % GRID_COLS == other % GRID_COLS
+        if same_col:
+            vertical += 1
+        elif same_row:
+            horizontal += 1
+        else:
+            diagonal += 1
+
+    if not (vertical or horizontal or diagonal):
+        return ""
+    if vertical > horizontal and vertical >= diagonal:
+        return ("\nPomylki sa glownie w pionie (pole mylone z tym nad/pod nim).\n"
+                "Sprawdz kat kamery i czy podczas kalibracji nie zmieniala sie\n"
+                "wysokosc glowy - pionowy sygnal jest slabszy niz poziomy.")
+    if horizontal > vertical and horizontal >= diagonal:
+        return ("\nPomylki sa glownie w poziomie (pole mylone z sasiadem obok).\n"
+                "To zwykle znaczy, ze kolumny sa za waskie jak na dokladnosc\n"
+                "z kamery RGB - rozwaz siatke 3x3 zamiast 3x4.")
+    return ("\nPomylki nie ukladaja sie w jeden kierunek - to raczej ogolny szum\n"
+            "(oswietlenie, odbicia w okularach, ruchy glowy) niz blad geometrii.")
+
+
 def draw_grid(canvas, rects, active_zone=None, progress=0.0, labels=None):
     for i, (x1, y1, x2, y2) in enumerate(rects):
         cv2.rectangle(canvas, (x1, y1), (x2, y2), (60, 60, 60), 1)
@@ -267,15 +308,22 @@ class ZoneClassifier:
                 X, y, test_size=0.25, stratify=y, random_state=0)
         self.clf.fit(X_tr, y_tr)
         acc = float(self.clf.score(X_te, y_te))
-        per_zone = {}
+        per_zone, confusions = {}, {}
         pred = self.clf.predict(X_te)
         for z in range(N_ZONES):
             mask = y_te == z
             if mask.any():
                 per_zone[z] = float((pred[mask] == z).mean())
+                # z czym mylone jest pole - kierunek pomylki wskazuje przyczyne
+                # inaczej niz sama trafnosc (pomylki w pionie sugeruja
+                # kompensacje pitch, w poziomie - yaw albo uklad kolumn)
+                wrong = pred[mask][pred[mask] != z]
+                if len(wrong):
+                    top = Counter(wrong.tolist()).most_common(1)[0]
+                    confusions[z] = (int(top[0]), top[1] / int(mask.sum()))
         self.clf.fit(X, y)          # finalny model: cale dane
         self.trained = True
-        return acc, per_zone
+        return acc, per_zone, confusions
 
     def predict(self, feat_vec):
         probs = self.clf.predict_proba([feat_vec])[0]
@@ -332,7 +380,8 @@ class DwellTracker:
 # ----------------------------------------------------------------------------
 # KALIBRACJA
 # ----------------------------------------------------------------------------
-def run_calibration(cap, landmarker, screen_w, screen_h, fullscreen=True):
+def run_calibration(cap, landmarker, screen_w, screen_h, fullscreen=True,
+                    settle_time=SETTLE_TIME_S):
     screen_w, screen_h = open_grid_window("Kalibracja", screen_w, screen_h, fullscreen)
     rects = zone_rects(screen_w, screen_h)
     X, y, groups = [], [], []
@@ -346,7 +395,7 @@ def run_calibration(cap, landmarker, screen_w, screen_h, fullscreen=True):
 
         for zone_idx in order:
             collected = 0
-            settle_until = time.time() + SETTLE_TIME_S
+            settle_until = time.time() + settle_time
 
             while collected < per_round:
                 ok, frame = cap.read()
@@ -360,13 +409,23 @@ def run_calibration(cap, landmarker, screen_w, screen_h, fullscreen=True):
                     continue
                 read_failures = 0
 
-                settling = time.time() < settle_until
+                remaining = settle_until - time.time()
+                settling = remaining > 0
 
                 canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
                 draw_grid(canvas, rects, active_zone=zone_idx,
                           progress=0.0 if settling else collected / per_round)
+
+                # odliczanie w polu: bez niego zmiana pola jest zaskoczeniem
+                # i pierwsze probki lapia wzrok jeszcze w drodze
+                if settling:
+                    x1, y1, x2, y2 = rects[zone_idx]
+                    cv2.putText(canvas, str(int(remaining) + 1),
+                                ((x1 + x2) // 2 - 30, (y1 + y2) // 2 + 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 2.5, (120, 120, 120), 4)
+
                 status = ("Przenies wzrok na podswietlone pole..." if settling
-                          else "Patrz na podswietlone pole (ESC = przerwij)")
+                          else "PATRZ - zbieram probki (ESC = przerwij)")
                 cv2.putText(canvas, status, (30, screen_h - 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
                 cv2.putText(canvas, f"runda {round_idx + 1}/{CALIB_ROUNDS}",
@@ -514,6 +573,10 @@ def main():
     parser.add_argument("--list-cameras", action="store_true",
                         help="wypisz kamery, ktore realnie oddaja obraz")
     parser.add_argument("--camera", type=int, default=0, help="indeks kamery (domyslnie 0)")
+    parser.add_argument("--settle", type=float, default=SETTLE_TIME_S,
+                        help=f"czas na przeniesienie wzroku po zmianie pola, "
+                             f"w sekundach (domyslnie {SETTLE_TIME_S}); zwieksz, "
+                             f"jesli nie nadazasz za zmianami")
     parser.add_argument("--windowed", action="store_true",
                         help="siatka w oknie zamiast na pelnym ekranie "
                              "(kalibracja i praca musza uzywac tego samego trybu)")
@@ -561,17 +624,27 @@ def main():
 
         elif args.calibrate:
             X, y, groups = run_calibration(cap, landmarker, args.width, args.height,
-                                           fullscreen=not args.windowed)
+                                           fullscreen=not args.windowed,
+                                           settle_time=args.settle)
             if X is not None:
                 clf = ZoneClassifier()
-                acc, per_zone = clf.fit_with_report(X, y, groups)
+                acc, per_zone, confusions = clf.fit_with_report(X, y, groups)
                 clf.save()
+                np.savez(CALIB_DATA_PATH, X=X, y=y, groups=groups)
                 print(f"\nKalibracja zapisana do {CALIB_MODEL_PATH} ({len(X)} probek).")
+                print(f"Probki zapisane do {CALIB_DATA_PATH} (do analizy bez "
+                      f"powtarzania kalibracji).")
                 print(f"Trafnosc na odlozonej rundzie: {acc:.1%}")
-                weak = [z for z, a in per_zone.items() if a < 0.6]
+                weak = sorted(z for z, a in per_zone.items() if a < 0.6)
                 if weak:
-                    print("Slabo rozpoznawane pola: "
-                          + ", ".join(str(z + 1) for z in sorted(weak)))
+                    print("\nSlabo rozpoznawane pola (pole: trafnosc -> najczestsza pomylka):")
+                    for z in weak:
+                        line = f"  pole {z + 1}: {per_zone[z]:.0%}"
+                        if z in confusions:
+                            other, share = confusions[z]
+                            line += f" -> mylone z polem {other + 1} ({share:.0%} probek)"
+                        print(line)
+                    print(describe_confusion_pattern(weak, confusions))
                 if acc < 0.7:
                     print("UWAGA: niska trafnosc. Sprobuj poprawic oswietlenie, "
                           "ustabilizowac pozycje glowy i powtorzyc kalibracje.\n"
